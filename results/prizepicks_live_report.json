@@ -1,0 +1,10 @@
+{
+  "requested_at": "2026-10-09",
+  "provider": "PrizePicks public projections endpoint",
+  "request": "https://api.prizepicks.com/projections?league_id=7&per_page=250",
+  "http_status": 403,
+  "status": "unavailable",
+  "projections": [],
+  "reason": "The public endpoint denied access. No current PrizePicks lines or player statistics were available to calculate or rank hit probabilities.",
+  "note": "No picks were fabricated. A 403 response is not evidence that any prop has a particular hit rate."
+}

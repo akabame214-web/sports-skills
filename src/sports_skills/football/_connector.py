@@ -6,6 +6,7 @@ import gzip
 import io
 import json
 import logging
+import random
 import re
 import threading
 import time
@@ -512,6 +513,7 @@ def _live_http_fetch(
                 "error": True,
                 "status_code": e.code,
                 "message": _summarize_http_error(e.code, url, body),
+                "retry_after": e.headers.get("Retry-After") if e.headers else None,
             }
             if not _is_retryable(e):
                 # Client error (400, 401, 403, 404) — don't retry
@@ -539,10 +541,34 @@ def _live_http_fetch(
 
         # Exponential backoff before retry
         if attempt < max_retries:
-            delay = min(_RETRY_BASE_DELAY * (2**attempt), _RETRY_MAX_DELAY)
-            # Extra backoff for 429 rate limits
+            delay = min(
+                _RETRY_BASE_DELAY * (2**attempt) * random.uniform(0.8, 1.2),
+                _RETRY_MAX_DELAY,
+            )
             if isinstance(last_error, dict) and last_error.get("status_code") == 429:
-                delay = min(delay * 2, _RETRY_MAX_DELAY * 2)
+                retry_after = last_error.get("retry_after")
+                if retry_after is not None:
+                    try:
+                        server_delay = max(0.0, float(retry_after))
+                    except (TypeError, ValueError):
+                        from email.utils import parsedate_to_datetime
+
+                        try:
+                            retry_at = parsedate_to_datetime(retry_after)
+                            if retry_at.tzinfo is None:
+                                retry_at = retry_at.replace(tzinfo=timezone.utc)
+                            server_delay = max(
+                                0.0,
+                                (retry_at - datetime.now(timezone.utc)).total_seconds(),
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            server_delay = None
+                    if server_delay is not None:
+                        if server_delay > _RETRY_MAX_DELAY:
+                            break
+                        delay = max(delay, server_delay)
+                else:
+                    delay = min(delay * 2, _RETRY_MAX_DELAY)
             time.sleep(delay)
 
     if max_retries > 0:

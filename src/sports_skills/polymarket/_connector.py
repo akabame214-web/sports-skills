@@ -1,10 +1,12 @@
 import json
+import random
 import re
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 from sports_skills import _replay
 
@@ -14,6 +16,11 @@ from sports_skills import _replay
 
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 CLOB_BASE_URL = "https://clob.polymarket.com"
+_HTTP_TIMEOUT = 30
+_MAX_HTTP_RETRIES = 2
+_RETRY_BASE_DELAY = 0.5
+_RETRY_MAX_DELAY = 8.0
+_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 # Sports tag ID on Polymarket
 SPORTS_TAG_ID = 1
@@ -135,35 +142,87 @@ def _get_json(url, rate_limiter, cache_key, ttl):
     try:
         data = json.loads(raw.decode())
     except Exception as e:
-        return {"error": True, "message": str(e)}
+        return {"error": True, "message": str(e), "malformed_json": True}
     _cache_set(cache_key, data, ttl=ttl)
     return data
 
 
-def _http_fetch(url, rate_limiter):
+def _http_fetch(url, rate_limiter, timeout=_HTTP_TIMEOUT, max_retries=_MAX_HTTP_RETRIES):
     """Public GET honouring ``SPORTS_SKILLS_REPLAY`` (see ``_replay``).
 
     Returns (data_bytes, None) or (None, error_dict). In replay mode no network
     call or rate-limit wait happens. Authenticated trading calls go through
     ``_cli`` / py_clob_client_v2 and are never recorded or replayed.
     """
-    return _replay.fetch(url, lambda: _live_http_fetch(url, rate_limiter))
+    return _replay.fetch(
+        url,
+        lambda: _live_http_fetch(
+            url, rate_limiter, timeout=timeout, max_retries=max_retries
+        ),
+    )
 
 
-def _live_http_fetch(url, rate_limiter):
-    rate_limiter.acquire()
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", _USER_AGENT)
-    req.add_header("Accept", "application/json")
-
+def _retry_after_seconds(value):
+    if value is None:
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read(), None
-    except urllib.error.HTTPError as e:
-        body = e.read().decode() if e.fp else ""
-        return None, {"error": True, "status_code": e.code, "message": body}
-    except Exception as e:
-        return None, {"error": True, "message": str(e)}
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        from email.utils import parsedate_to_datetime
+
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
+def _live_http_fetch(url, rate_limiter, timeout=_HTTP_TIMEOUT, max_retries=_MAX_HTTP_RETRIES):
+    last_error = None
+    for attempt in range(max_retries + 1):
+        if rate_limiter is not None:
+            rate_limiter.acquire()
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", _USER_AGENT)
+        req.add_header("Accept", "application/json")
+        retry_after = None
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read(), None
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace") if exc.fp else ""
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            last_error = {
+                "error": True,
+                "status_code": exc.code,
+                "message": body,
+                "retry_after": retry_after,
+            }
+            if exc.code not in _RETRYABLE_STATUS_CODES:
+                return None, last_error
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            last_error = {"error": True, "message": str(exc)}
+        except Exception as exc:
+            return None, {"error": True, "message": str(exc)}
+
+        if attempt >= max_retries:
+            break
+        exponential = min(
+            _RETRY_BASE_DELAY * (2**attempt) * random.uniform(0.8, 1.2),
+            _RETRY_MAX_DELAY,
+        )
+        server_delay = _retry_after_seconds(retry_after)
+        if server_delay is not None:
+            if server_delay > _RETRY_MAX_DELAY:
+                break
+            delay = max(exponential, server_delay)
+        else:
+            delay = exponential
+        time.sleep(delay)
+
+    return None, last_error or {"error": True, "message": "Request failed"}
 
 
 # ============================================================
@@ -185,6 +244,12 @@ def _check_error(response):
         code = response.get("status_code", "unknown")
         msg = response.get("message", "Unknown error")
         error = _error(f"API error ({code}): {msg}")
+        if "status_code" in response:
+            error["status_code"] = response["status_code"]
+        if response.get("retry_after") is not None:
+            error["retry_after"] = response["retry_after"]
+        if response.get("malformed_json"):
+            error["malformed_json"] = True
         # Keep replay_miss/replay_error visible in the public error shape.
         for flag in ("replay_miss", "replay_error"):
             if response.get(flag):
